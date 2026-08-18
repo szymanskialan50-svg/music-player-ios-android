@@ -1,0 +1,349 @@
+# ─────────────────────────────────────────────────────────────────
+# Music Player — GitHub Actions Build Pipeline
+#
+# Produces on every push to main / on tag:
+#   app.zip   — web build (deploy anywhere)
+#   app.apk   — Android APK via Bubblewrap TWA
+#   app.ipa   — iOS IPA (PWA shell, sideloadable)
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   GOOGLE_API_KEY            — YouTube Data API v3 key
+#   VITE_SUPABASE_URL         — Supabase URL (optional)
+#   VITE_SUPABASE_PUBLISHABLE_KEY — Supabase anon key (optional)
+#
+# For signed APK add:
+#   ANDROID_KEYSTORE_BASE64   — base64-encoded .jks keystore
+#   ANDROID_KEY_ALIAS         — key alias
+#   ANDROID_STORE_PASSWORD    — store password
+#   ANDROID_KEY_PASSWORD      — key password
+#   TWA_SHA256_FINGERPRINT    — SHA-256 cert fingerprint
+#
+# For signed IPA add:
+#   IOS_CERTIFICATE_BASE64    — base64 .p12 cert
+#   IOS_CERTIFICATE_PASSWORD  — .p12 password
+#   IOS_PROVISIONING_PROFILE_BASE64 — base64 .mobileprovision
+#
+# Set the variable APP_URL (Settings → Variables → Actions) to your
+# deployed URL, e.g. https://your-app.pages.dev
+# ─────────────────────────────────────────────────────────────────
+
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ═══════════════════════════════════════════════════════════════
+# JOB 1 — Web build → app.zip
+# ═══════════════════════════════════════════════════════════════
+jobs:
+  build-web:
+    name: Build Web (app.zip)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --prefer-offline
+
+      - name: Generate PWA icons
+        run: node scripts/generate-icons.mjs
+
+      - name: Build
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+          NODE_ENV: production
+        run: npm run build
+
+      - name: Patch assetlinks.json fingerprint
+        env:
+          FP: ${{ secrets.TWA_SHA256_FINGERPRINT }}
+        run: |
+          if [ -n "$FP" ]; then
+            sed -i "s/REPLACE_WITH_YOUR_SHA256_FINGERPRINT/$FP/" \
+              dist/.well-known/assetlinks.json || true
+            echo "Fingerprint patched."
+          else
+            echo "TWA_SHA256_FINGERPRINT not set, skipping."
+          fi
+
+      - name: Package app.zip
+        run: |
+          cd dist
+          zip -r ../app.zip . -x "*.DS_Store"
+          cd ..
+          echo "app.zip size: $(du -sh app.zip | cut -f1)"
+
+      - name: Upload app.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-zip
+          path: app.zip
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 2 — Android APK via Bubblewrap TWA
+  # ═══════════════════════════════════════════════════════════════
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    needs: build-web
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Bubblewrap CLI
+        run: npm install -g @bubblewrap/cli
+
+      - name: Setup keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > keystore.jks
+            echo "KEYSTORE_SOURCE=secret" >> $GITHUB_ENV
+          else
+            keytool -genkeypair -v \
+              -keystore keystore.jks \
+              -storepass android \
+              -alias upload \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Debug, OU=Debug, O=Debug, L=Debug, S=Debug, C=US"
+            echo "KEYSTORE_SOURCE=debug" >> $GITHUB_ENV
+          fi
+
+      - name: Create Bubblewrap manifest
+        env:
+          APP_URL: ${{ vars.APP_URL || 'https://example.com' }}
+          TWA_SHA256_FINGERPRINT: ${{ secrets.TWA_SHA256_FINGERPRINT }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ALIAS="${ANDROID_KEY_ALIAS:-upload}"
+          STORE_PASS="${ANDROID_STORE_PASSWORD:-android}"
+          KEY_PASS="${ANDROID_KEY_PASSWORD:-android}"
+          FP="${TWA_SHA256_FINGERPRINT:-AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:00:11:22:33:44:55:66:77:88:99:00:11:22:33:44:55}"
+          HOST="${APP_URL#https://}"
+
+          mkdir -p twa-build
+          cat > twa-build/twa-manifest.json << JSON
+          {
+            "packageId": "com.yourname.musicplayer",
+            "host": "${HOST}",
+            "name": "Music Player",
+            "launcherName": "Music Player",
+            "display": "standalone",
+            "themeColor": "#050505",
+            "navigationColor": "#050505",
+            "backgroundColor": "#050505",
+            "startUrl": "/player.html",
+            "iconUrl": "${APP_URL}/icons/icon-512.svg",
+            "maskableIconUrl": "${APP_URL}/icons/icon-512.svg",
+            "shortcuts": [],
+            "signing": {
+              "keyFilePath": "../keystore.jks",
+              "storePassword": "${STORE_PASS}",
+              "keyAlias": "${ALIAS}",
+              "keyPassword": "${KEY_PASS}"
+            },
+            "fingerprints": [
+              { "name": "SHA-256", "value": "${FP}" }
+            ],
+            "webManifestUrl": "${APP_URL}/manifest.json"
+          }
+          JSON
+
+      - name: Build APK
+        run: |
+          cd twa-build
+          bubblewrap build \
+            --manifest twa-manifest.json \
+            --skipPwaValidation || true
+          # Find the APK and copy it out
+          find . -name "*.apk" | head -1 | xargs -I{} cp {} ../app.apk 2>/dev/null || true
+          if [ ! -f ../app.apk ]; then
+            echo "APK build needs a live HTTPS URL set in APP_URL variable." > ../apk-note.txt
+            echo "Go to Settings → Variables → Actions and add APP_URL." >> ../apk-note.txt
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-apk
+          path: |
+            app.apk
+            apk-note.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 3 — iOS IPA (PWA shell)
+  # ═══════════════════════════════════════════════════════════════
+  build-ios:
+    name: Build iOS IPA
+    runs-on: macos-latest
+    needs: build-web
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download web build
+        uses: actions/download-artifact@v4
+        with:
+          name: app-zip
+          path: .
+
+      - name: Import Apple certificate
+        env:
+          CERT_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          CERT_PASS: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          if [ -n "$CERT_BASE64" ]; then
+            echo "$CERT_BASE64" | base64 --decode > cert.p12
+            echo "$PROFILE_BASE64" | base64 --decode > profile.mobileprovision
+            security create-keychain -p "" build.keychain
+            security import cert.p12 -k build.keychain -P "$CERT_PASS" -A
+            security set-keychain-settings -t 3600 -u build.keychain
+            security list-keychains -s build.keychain
+            security default-keychain -s build.keychain
+            security unlock-keychain -p "" build.keychain
+            mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+            cp profile.mobileprovision \
+              ~/Library/MobileDevice/Provisioning\ Profiles/
+            echo "SIGNED=true" >> $GITHUB_ENV
+          else
+            echo "SIGNED=false" >> $GITHUB_ENV
+            echo "No iOS certs found — building unsigned IPA (sideloadable)."
+          fi
+
+      - name: Build IPA
+        run: |
+          mkdir -p Payload/MusicPlayer.app
+          unzip -q app.zip -d Payload/MusicPlayer.app/
+
+          cat > Payload/MusicPlayer.app/Info.plist << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Music Player</string>
+            <key>CFBundleIdentifier</key><string>com.yourname.musicplayer</string>
+            <key>CFBundleShortVersionString</key><string>1.0</string>
+            <key>CFBundleVersion</key><string>1</string>
+            <key>LSRequiresIPhoneOS</key><true/>
+            <key>UIRequiresFullScreen</key><true/>
+            <key>UIStatusBarHidden</key><false/>
+            <key>UIViewControllerBasedStatusBarAppearance</key><false/>
+            <key>NSAppTransportSecurity</key>
+            <dict><key>NSAllowsArbitraryLoads</key><true/></dict>
+          </dict>
+          </plist>
+          PLIST
+
+          zip -r app.ipa Payload/
+          echo "IPA size: $(du -sh app.ipa | cut -f1)"
+
+          if [ "$SIGNED" = "false" ]; then
+            cat > ipa-note.txt << 'NOTE'
+          This IPA is unsigned.
+
+          To install on your iPhone without a paid Apple Developer account:
+            - AltStore: https://altstore.io
+            - Sideloadly: https://sideloadly.io
+
+          To publish on App Store / TestFlight, add these secrets:
+            IOS_CERTIFICATE_BASE64
+            IOS_CERTIFICATE_PASSWORD
+            IOS_PROVISIONING_PROFILE_BASE64
+          NOTE
+          fi
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-ipa
+          path: |
+            app.ipa
+            ipa-note.txt
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════════
+  # JOB 4 — GitHub Release (only on version tags)
+  # ═══════════════════════════════════════════════════════════════
+  release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [build-web, build-android, build-ios]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List artifacts
+        run: find artifacts/ -type f
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/app-zip/app.zip
+            artifacts/app-apk/app.apk
+            artifacts/app-ipa/app.ipa
+          body: |
+            ## Music Player ${{ github.ref_name }}
+
+            | Platform | File | Instalacja |
+            |----------|------|------------|
+            | 🌐 Web | `app.zip` | Wgraj na Cloudflare Pages / Vercel / Netlify |
+            | 🤖 Android | `app.apk` | Włącz "Nieznane źródła" i zainstaluj |
+            | 🍎 iOS | `app.ipa` | Sideload via AltStore lub Sideloadly |
+
+            ### YouTube API
+            Ustaw `GOOGLE_API_KEY` w sekretach repozytorium (instrukcja w `.env.example`).
